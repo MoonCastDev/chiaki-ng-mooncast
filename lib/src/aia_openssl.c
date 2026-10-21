@@ -76,6 +76,10 @@ void *chiaki_aia_trust_store(CURL *connection)
 	if(curl_easy_getinfo(connection, CURLINFO_CAINFO, &file) != CURLE_OK ||
 		curl_easy_getinfo(connection, CURLINFO_CAPATH, &path) != CURLE_OK)
 		goto error;
+#ifdef __ANDROID__
+	if(!file && !path)
+		file = getenv("MC_CA_BUNDLE");   // MoonCast: Android curl has no built-in CA path
+#endif
 #ifdef _WIN32
 	const curl_version_info_data *version = curl_version_info(CURLVERSION_NOW);
 	if(version->ssl_version && strstr(version->ssl_version, "Schannel") && !file) {

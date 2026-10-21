@@ -52,6 +52,23 @@
 
 #include <curl/curl.h>
 
+#ifdef __ANDROID__
+#include <stdlib.h>
+// MoonCast: Android's libcurl has no CA store, so every PSN HTTPS call failed with "SSL peer certificate
+// ... was not OK". The app writes the device's trusted roots (AndroidCAStore) to a PEM file and exports its
+// path as MC_CA_BUNDLE; give it to every curl handle here (the AIA chain repair below builds on CURLINFO_CAINFO).
+static CURL *mc_curl_easy_init(void)
+{
+	CURL *c = curl_easy_init();
+	const char *ca = getenv("MC_CA_BUNDLE");
+	if(c && ca && *ca)
+		curl_easy_setopt(c, CURLOPT_CAINFO, ca);
+	return c;
+}
+#define curl_easy_init mc_curl_easy_init
+#endif
+
+
 #include "../aia.h"
 #if !defined(__SWITCH__) && !defined(__ANDROID__)
 #include <event2/event.h>
@@ -82,6 +99,9 @@
 #define WEBSOCKET_MAX_FRAME_SIZE 64 * 1024
 #define SESSION_CREATION_TIMEOUT_SEC 30
 #define SESSION_START_TIMEOUT_SEC 30
+// MoonCast: a console in rest mode only joins the PSN session (MEMBER_CREATED) once it has woken up, which
+// took ~60 s in testing; with 30 s the first attempt always failed and only the retry connected.
+#define SESSION_START_WAKE_TIMEOUT_SEC 60
 #define SESSION_DELETION_TIMEOUT_SEC 3
 #define SELECT_CANDIDATE_TIMEOUT_SEC 0.5F
 #define SELECT_CANDIDATE_TRIES 20
@@ -1160,7 +1180,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_holepunch_session_start(
                     | NOTIFICATION_TYPE_CUSTOM_DATA1_UPDATED;
     while (!finished)
     {
-        err = wait_for_notification(session, &notif, notif_query, SESSION_START_TIMEOUT_SEC * 1000);
+        err = wait_for_notification(session, &notif, notif_query, SESSION_START_WAKE_TIMEOUT_SEC * 1000);
         if (err == CHIAKI_ERR_TIMEOUT)
         {
             CHIAKI_LOGE(session->log, "chiaki_holepunch_session_start: Timed out waiting for holepunch session start notifications.");
@@ -2243,6 +2263,10 @@ ws_connect_attempt:
             else {
                 const char *ca_path = NULL;
                 CURLcode ca_info_res = curl_easy_getinfo(curl, CURLINFO_CAINFO, &ca_path);
+#ifdef __ANDROID__
+                if(ca_info_res == CURLE_OK && !ca_path)
+                    ca_path = getenv("MC_CA_BUNDLE");   // MoonCast: MC_CA_BUNDLE (aia blob)
+#endif
                 FILE *ca_file = ca_path ? fopen(ca_path, "rb") : NULL;
                 if(ca_info_res == CURLE_OK && (!ca_path || ca_file))
                     aia_blob = chiaki_aia_blob_with_ca(ca_file, &aia_blob_len);

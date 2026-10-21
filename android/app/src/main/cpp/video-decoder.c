@@ -23,31 +23,32 @@ ChiakiErrorCode android_chiaki_video_decoder_init(AndroidChiakiVideoDecoder *dec
 	decoder->target_height = target_height;
 	decoder->target_codec = codec;
 	decoder->shutdown_output = false;
+	decoder->mc_frames_shown = 0;
+	decoder->mc_frames_lost = 0;
 	return chiaki_mutex_init(&decoder->codec_mutex, false);
 }
 
 static void kill_decoder(AndroidChiakiVideoDecoder *decoder)
 {
+	// MoonCast (#37): clean shutdown. No AMediaCodec call may follow AMediaCodec_stop(): on Android 9 that aborts.
 	chiaki_mutex_lock(&decoder->codec_mutex);
-	decoder->shutdown_output = true;
+	decoder->shutdown_output = true; // video_sample() stops feeding, the output thread ends on its next poll
 	ssize_t codec_buf_index = AMediaCodec_dequeueInputBuffer(decoder->codec, 1000);
 	if(codec_buf_index >= 0)
 	{
 		CHIAKI_LOGI(decoder->log, "Video Decoder sending EOS buffer");
 		AMediaCodec_queueInputBuffer(decoder->codec, (size_t)codec_buf_index, 0, 0, decoder->timestamp_cur++, AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM);
-		AMediaCodec_stop(decoder->codec);
-		chiaki_mutex_unlock(&decoder->codec_mutex);
-		chiaki_thread_join(&decoder->output_thread, NULL);
 	}
 	else
-	{
 		CHIAKI_LOGE(decoder->log, "Failed to get input buffer for shutting down Video Decoder!");
-		AMediaCodec_stop(decoder->codec);
-		chiaki_mutex_unlock(&decoder->codec_mutex);
-	}
+	chiaki_mutex_unlock(&decoder->codec_mutex);
+	chiaki_thread_join(&decoder->output_thread, NULL);
+	chiaki_mutex_lock(&decoder->codec_mutex);
+	AMediaCodec_stop(decoder->codec);
 	AMediaCodec_delete(decoder->codec);
 	decoder->codec = NULL;
 	decoder->shutdown_output = false;
+	chiaki_mutex_unlock(&decoder->codec_mutex);
 }
 
 void android_chiaki_video_decoder_fini(AndroidChiakiVideoDecoder *decoder)
@@ -63,10 +64,17 @@ void android_chiaki_video_decoder_set_surface(AndroidChiakiVideoDecoder *decoder
 
 	if(!surface)
 	{
+		// MoonCast (#37): kill_decoder() takes codec_mutex itself and it isn't recursive, so release it first
+		chiaki_mutex_unlock(&decoder->codec_mutex);
 		if(decoder->codec)
 		{
 			kill_decoder(decoder);
 			CHIAKI_LOGI(decoder->log, "Decoder shut down after surface was removed");
+		}
+		if(decoder->window)
+		{
+			ANativeWindow_release(decoder->window);
+			decoder->window = NULL;
 		}
 		return;
 	}
@@ -143,6 +151,8 @@ bool android_chiaki_video_decoder_video_sample(uint8_t *buf, size_t buf_size, in
 {
 	bool r = true;
 	AndroidChiakiVideoDecoder *decoder = user;
+	if(frames_lost > 0)
+		decoder->mc_frames_lost += frames_lost;
 	chiaki_mutex_lock(&decoder->codec_mutex);
 
 	if(!decoder->codec)
@@ -150,6 +160,8 @@ bool android_chiaki_video_decoder_video_sample(uint8_t *buf, size_t buf_size, in
 		CHIAKI_LOGE(decoder->log, "Received video data, but decoder is not initialized!");
 		goto beach;
 	}
+	if(decoder->shutdown_output)
+		goto beach; // MoonCast (#37): shutting down, the codec takes no more input
 
 	while(buf_size > 0)
 	{
@@ -163,6 +175,12 @@ bool android_chiaki_video_decoder_video_sample(uint8_t *buf, size_t buf_size, in
 
 		size_t codec_buf_size;
 		uint8_t *codec_buf = AMediaCodec_getInputBuffer(decoder->codec, (size_t)codec_buf_index, &codec_buf_size);
+		if(!codec_buf) // MoonCast (#37): no input buffer, the codec has failed (e.g. its surface is gone)
+		{
+			CHIAKI_LOGE(decoder->log, "AMediaCodec_getInputBuffer() returned no buffer");
+			r = false;
+			goto beach;
+		}
 		size_t codec_sample_size = buf_size;
 		if(codec_sample_size > codec_buf_size)
 		{
@@ -192,10 +210,12 @@ static void *android_chiaki_video_decoder_output_thread_func(void *user)
 	while(1)
 	{
 		AMediaCodecBufferInfo info;
-		ssize_t status = AMediaCodec_dequeueOutputBuffer(decoder->codec, &info, -1);
+		ssize_t status = AMediaCodec_dequeueOutputBuffer(decoder->codec, &info, 50000); // MoonCast (#37): poll, see shutdown_output
 		if(status >= 0)
 		{
 			AMediaCodec_releaseOutputBuffer(decoder->codec, (size_t)status, info.size != 0);
+			if(info.size != 0)
+				decoder->mc_frames_shown++;
 			if(info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM)
 			{
 				CHIAKI_LOGI(decoder->log, "AMediaCodec reported EOS");

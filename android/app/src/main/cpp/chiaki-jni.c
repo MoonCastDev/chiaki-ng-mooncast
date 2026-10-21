@@ -9,6 +9,7 @@
 #include <chiaki/session.h>
 #include <chiaki/discoveryservice.h>
 #include <chiaki/regist.h>
+#include <chiaki/remote/holepunch.h>
 
 #include <string.h>
 #include <linux/in.h>
@@ -206,6 +207,78 @@ static void android_chiaki_event_cb(ChiakiEvent *event, void *user)
 	(*global_vm)->DetachCurrentThread(global_vm);
 }
 
+
+// ---- MoonCast: Remote Play over the internet (PSN hole-punch, no VPN / no port-forward) ----
+// Optional ConnectInfo field: absent in older Kotlin bindings -> NULL (LAN behaviour unchanged).
+static jobject mc_opt_field(JNIEnv *env, jobject obj, jclass cls, const char *name, const char *sig)
+{
+	jfieldID fid = E->GetFieldID(env, cls, name, sig);
+	if(E->ExceptionCheck(env)) { E->ExceptionClear(env); return NULL; }
+	return fid ? E->GetObjectField(env, obj, fid) : NULL;
+}
+
+static int mc_hex_nibble(char c)
+{
+	if(c >= '0' && c <= '9') return c - '0';
+	if(c >= 'a' && c <= 'f') return c - 'a' + 10;
+	if(c >= 'A' && c <= 'F') return c - 'A' + 10;
+	return -1;
+}
+
+// Same steps as chiaki-ng's StreamSession::InitiatePsnConnection + ConnectPsnConnection: PSN brokers the
+// connection and only the control hole is punched here - chiaki_session punches the data hole itself.
+static ChiakiHolepunchSession mc_psn_connect(ChiakiLog *log, const char *token, const char *duid_hex, bool ps5)
+{
+	size_t hex_len = strlen(duid_hex);
+	uint8_t duid[64];
+	if(hex_len == 0 || hex_len % 2 || hex_len / 2 > sizeof(duid))
+	{
+		CHIAKI_LOGE(log, "MoonCast PSN: invalid console duid");
+		return NULL;
+	}
+	for(size_t i = 0; i < hex_len / 2; i++)
+	{
+		int hi = mc_hex_nibble(duid_hex[2 * i]), lo = mc_hex_nibble(duid_hex[2 * i + 1]);
+		if(hi < 0 || lo < 0)
+		{
+			CHIAKI_LOGE(log, "MoonCast PSN: invalid console duid");
+			return NULL;
+		}
+		duid[i] = (uint8_t)((hi << 4) | lo);
+	}
+	ChiakiHolepunchSession hs = chiaki_holepunch_session_init(token, log);
+	if(!hs)
+	{
+		CHIAKI_LOGE(log, "MoonCast PSN: hole-punch session init failed (token?)");
+		return NULL;
+	}
+	// Port guessing (chiaki-ng's fix for port-rewriting NATs): when the STUN test sees a router that rewrites our
+	// port, advertise a spread of guessed ports and open many sockets so the console's packets hit one of them.
+	// Some JAL<->home punches got no candidate response at all; this targets that. Defaults: 75 guesses, 250 sockets.
+	chiaki_holepunch_session_force_port_guessing(hs, true);
+	// No UPnP probe: it only ever timed out (7 s per attempt) and the hole-punch works without it.
+	ChiakiErrorCode err = chiaki_holepunch_session_create(hs);
+	if(err == CHIAKI_ERR_SUCCESS)
+		err = holepunch_session_create_offer(hs);
+	{
+		int32_t inc = 0; bool rnd = false;
+		if(chiaki_holepunch_session_get_stun_allocation(hs, &inc, &rnd))
+			CHIAKI_LOGI(log, "MoonCast PSN: our NAT allocation increment %d, random %d", (int)inc, (int)rnd);
+	}
+	if(err == CHIAKI_ERR_SUCCESS)
+		err = chiaki_holepunch_session_start(hs, duid, ps5 ? CHIAKI_HOLEPUNCH_CONSOLE_TYPE_PS5 : CHIAKI_HOLEPUNCH_CONSOLE_TYPE_PS4);
+	if(err == CHIAKI_ERR_SUCCESS)
+		err = chiaki_holepunch_session_punch_hole(hs, CHIAKI_HOLEPUNCH_PORT_TYPE_CTRL);
+	if(err != CHIAKI_ERR_SUCCESS)
+	{
+		CHIAKI_LOGE(log, "MoonCast PSN: hole-punch failed: %s", chiaki_error_string(err));
+		chiaki_holepunch_session_fini(hs);
+		return NULL;
+	}
+	CHIAKI_LOGI(log, "MoonCast PSN: control hole punched, starting session over the internet");
+	return hs;
+}
+
 JNIEXPORT void JNICALL JNI_FCN(sessionCreate)(JNIEnv *env, jobject obj, jobject result, jobject connect_info_obj, jstring log_file_str, jboolean log_verbose, jobject java_session)
 {
 	AndroidChiakiSession *session = NULL;
@@ -271,6 +344,12 @@ JNIEXPORT void JNICALL JNI_FCN(sessionCreate)(JNIEnv *env, jobject obj, jobject 
 	connect_info.video_profile.codec = (ChiakiCodec)target_value;
 
 	connect_info.video_profile_auto_downgrade = true;
+	// MoonCast: the Android binding left these zeroed. packet_loss_max 0 made chiaki always report 0% loss to the
+	// console ("Clamping reported packet loss: measured=12.1% reported_max=0.0%"), so the PS5 never lowered its
+	// bitrate on a lossy link. Same values as chiaki-ng desktop: report real loss up to 5%, and request a fresh
+	// keyframe (IDR) when FEC can't repair a frame instead of decoding corrupt frames until the next one.
+	connect_info.packet_loss_max = 0.05;
+	connect_info.enable_idr_on_fec_failure = true;
 
 	session = CHIAKI_NEW(AndroidChiakiSession);
 	if(!session)
@@ -301,6 +380,37 @@ JNIEXPORT void JNICALL JNI_FCN(sessionCreate)(JNIEnv *env, jobject obj, jobject 
 	session->audio_output = android_chiaki_audio_output_new(log);
 
 	android_chiaki_audio_decoder_set_cb(&session->audio_decoder, android_chiaki_audio_output_settings, android_chiaki_audio_output_frame, session->audio_output);
+
+	// MoonCast: Remote Play over the internet when the app passes a PSN token + console duid
+	{
+		jstring psn_token_s = mc_opt_field(env, connect_info_obj, connect_info_class, "psnToken", "Ljava/lang/String;");
+		jstring duid_s = mc_opt_field(env, connect_info_obj, connect_info_class, "duid", "Ljava/lang/String;");
+		jbyteArray psn_account_id_a = mc_opt_field(env, connect_info_obj, connect_info_class, "psnAccountId", "[B");
+		if(psn_token_s && duid_s)
+		{
+			const char *tok = E->GetStringUTFChars(env, psn_token_s, NULL);
+			const char *duid = E->GetStringUTFChars(env, duid_s, NULL);
+			connect_info.holepunch_session = mc_psn_connect(log, tok, duid, connect_info.ps5);
+			E->ReleaseStringUTFChars(env, psn_token_s, tok);
+			E->ReleaseStringUTFChars(env, duid_s, duid);
+			if(!connect_info.holepunch_session)
+			{
+				err = CHIAKI_ERR_HOST_UNREACH;
+				android_chiaki_video_decoder_fini(&session->video_decoder);
+				android_chiaki_audio_decoder_fini(&session->audio_decoder);
+				android_chiaki_audio_output_free(session->audio_output);
+				free(session);
+				session = NULL;
+				goto beach;
+			}
+			if(psn_account_id_a && E->GetArrayLength(env, psn_account_id_a) == CHIAKI_PSN_ACCOUNT_ID_SIZE)
+			{
+				jbyte *acc = E->GetByteArrayElements(env, psn_account_id_a, NULL);
+				memcpy(connect_info.psn_account_id, acc, CHIAKI_PSN_ACCOUNT_ID_SIZE);
+				E->ReleaseByteArrayElements(env, psn_account_id_a, acc, JNI_ABORT);
+			}
+		}
+	}
 
 	err = chiaki_session_init(&session->session, &connect_info, log);
 	if(err != CHIAKI_ERR_SUCCESS)
@@ -451,6 +561,33 @@ JNIEXPORT void JNICALL JNI_FCN(sessionSetControllerState)(JNIEnv *env, jobject o
 	controller_state.orient_z = E->GetFloatField(env, controller_state_java, session->java_controller_state_orient_z);
 	controller_state.orient_w = E->GetFloatField(env, controller_state_java, session->java_controller_state_orient_w);
 	chiaki_session_set_controller_state(&session->session, &controller_state);
+}
+
+/** MoonCast: [measured Mbps, packet loss 0..1, PS5-reported rtt, rtt measured at connect (ms), frames shown, frames lost] */
+JNIEXPORT jdoubleArray JNICALL JNI_FCN(sessionStats)(JNIEnv *env, jobject obj, jlong ptr)
+{
+	AndroidChiakiSession *session = (AndroidChiakiSession *)ptr;
+	jdouble v[6] = { 0, 0, 0, 0, 0, 0 };
+	if(session)
+	{
+		ChiakiStreamConnection *sc = &session->session.stream_connection;
+		v[0] = sc->measured_bitrate;
+		v[1] = sc->congestion_control.packet_loss;
+		v[2] = sc->mc_rtt;
+		v[3] = session->session.rtt_us / 1000.0;
+		v[4] = (jdouble)session->video_decoder.mc_frames_shown;
+		v[5] = (jdouble)session->video_decoder.mc_frames_lost;
+	}
+	jdoubleArray r = E->NewDoubleArray(env, 6);
+	if(r)
+		E->SetDoubleArrayRegion(env, r, 0, 6, v);
+	return r;
+}
+
+JNIEXPORT jint JNICALL JNI_FCN(sessionGotoBed)(JNIEnv *env, jobject obj, jlong ptr)
+{
+	AndroidChiakiSession *session = (AndroidChiakiSession *)ptr;
+	return session ? chiaki_session_goto_bed(&session->session) : CHIAKI_ERR_UNINITIALIZED;
 }
 
 JNIEXPORT void JNICALL JNI_FCN(sessionSetLoginPin)(JNIEnv *env, jobject obj, jlong ptr, jstring pin_java)
