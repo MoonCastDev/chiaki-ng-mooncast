@@ -85,13 +85,19 @@ static const char *mc_codec_name(AMediaCodec *codec, char **to_free)
 	return *to_free ? *to_free : "unknown";
 }
 
-static void mc_low_latency_keys(AMediaFormat *f, const char *name, int mode)
+// [level] drops keys for a decoder that refused them: 0 all, 1 no vendor keys, 2 also no vdec-lowlatency,
+// 3 priority only, 4 none (as Moonlight's decoder setup retries for PC streams)
+static void mc_low_latency_keys(AMediaFormat *f, const char *name, int mode, int level)
 {
-	if(mode < 1)
+	if(mode < 1 || level >= 4)
 		return;
-	AMediaFormat_setInt32(f, "low-latency", 1);       // Android 11's standard key
-	AMediaFormat_setInt32(f, "vdec-lowlatency", 1);   // MediaTek and Amlogic
 	AMediaFormat_setInt32(f, "priority", 0);          // real-time
+	if(level <= 2)
+		AMediaFormat_setInt32(f, "low-latency", 1);   // Android 11's standard key
+	if(level <= 1)
+		AMediaFormat_setInt32(f, "vdec-lowlatency", 1);   // MediaTek and Amlogic
+	if(level >= 1)
+		return;
 	bool qcom = mc_name_starts(name, "omx.qcom") || mc_name_starts(name, "c2.qti") || mc_name_starts(name, "c2.qcom");
 	if(qcom)
 	{
@@ -231,24 +237,37 @@ void android_chiaki_video_decoder_set_surface(AndroidChiakiVideoDecoder *decoder
 	AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_HEIGHT, decoder->target_height);
 	char *name_buf;
 	const char *name = mc_codec_name(decoder->codec, &name_buf);
-	mc_low_latency_keys(format, name, mc_latency_mode);
-	CHIAKI_LOGI(decoder->log, "MoonCast decoder: %s, latency mode %d", name, mc_latency_mode);
-
-	media_status_t r = AMediaCodec_configure(decoder->codec, format, decoder->window, NULL, 0);
-	if(r != AMEDIA_OK && mc_latency_mode >= 1)
-	{
-		// a decoder that refuses one of the low-latency keys: start again with a fresh decoder and none of them
-		CHIAKI_LOGW(decoder->log, "MoonCast decoder: configure with low-latency keys failed (%d), trying without", (int)r);
-		AMediaFormat_delete(format);
-		AMediaCodec_delete(decoder->codec);
-		decoder->codec = AMediaCodec_createDecoderByType(mime);
-		format = AMediaFormat_new();
-		AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, mime);
-		AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_WIDTH, decoder->target_width);
-		AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_HEIGHT, decoder->target_height);
-		r = decoder->codec ? AMediaCodec_configure(decoder->codec, format, decoder->window, NULL, 0) : AMEDIA_ERROR_UNKNOWN;
-	}
+	char name_copy[128];
+	strncpy(name_copy, name, sizeof(name_copy) - 1);
+	name_copy[sizeof(name_copy) - 1] = 0;
 	free(name_buf);
+	media_status_t r = AMEDIA_ERROR_UNKNOWN;
+	for(int level = 0; level <= 4; level++)
+	{
+		if(level > 0)
+		{
+			// a decoder that refused a key: start again with a fresh decoder and fewer of them
+			AMediaFormat_delete(format);
+			AMediaCodec_delete(decoder->codec);
+			decoder->codec = AMediaCodec_createDecoderByType(mime);
+			if(!decoder->codec)
+				break;
+			format = AMediaFormat_new();
+			AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, mime);
+			AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_WIDTH, decoder->target_width);
+			AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_HEIGHT, decoder->target_height);
+		}
+		mc_low_latency_keys(format, name_copy, mc_latency_mode, level);
+		r = AMediaCodec_configure(decoder->codec, format, decoder->window, NULL, 0);
+		if(r == AMEDIA_OK)
+		{
+			CHIAKI_LOGI(decoder->log, "MoonCast decoder: %s, latency mode %d, keys level %d", name_copy, mc_latency_mode, level);
+			break;
+		}
+		CHIAKI_LOGW(decoder->log, "MoonCast decoder: configure failed (%d) at keys level %d", (int)r, level);
+		if(mc_latency_mode < 1)
+			break;
+	}
 	if(!decoder->codec)
 	{
 		CHIAKI_LOGE(decoder->log, "Failed to create AMediaCodec for mime type %s", mime);
