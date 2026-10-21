@@ -22,6 +22,42 @@ void android_chiaki_video_decoder_set_latency_mode(int mode)
 	mc_latency_mode = mode;
 }
 
+// MoonCast frame pacing (Settings, PlayStation, Frame pacing), set by the app before each session
+static int mc_pacing_mode = 0;
+static int64_t mc_pacing_period_ns = 16666667;
+
+void android_chiaki_video_decoder_set_pacing(int mode, int fps)
+{
+	mc_pacing_mode = mode;
+	mc_pacing_period_ns = fps > 0 ? 1000000000LL / fps : 16666667;
+}
+
+static int64_t mc_now_ns(void)
+{
+	struct timespec t;
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (int64_t)t.tv_sec * 1000000000LL + t.tv_nsec;
+}
+
+// Show a decoded frame. Lowest delay: at once. Paced: one stream frame interval after the last one (so frames that
+// arrive unevenly over the network show on evenly spaced screen refreshes), but never more than 1 (balanced) or
+// 3 (smoothest) intervals late: past that it shows at once again, so the delay can't build up.
+static void mc_present(AndroidChiakiVideoDecoder *decoder, size_t index)
+{
+	if(mc_pacing_mode <= 0)
+	{
+		AMediaCodec_releaseOutputBuffer(decoder->codec, index, true);
+		return;
+	}
+	int64_t now = mc_now_ns();
+	int64_t cap = (mc_pacing_mode >= 2 ? 3 : 1) * mc_pacing_period_ns;
+	int64_t target = decoder->mc_last_present_ns + mc_pacing_period_ns;
+	if(target < now || target - now > cap)
+		target = now;
+	decoder->mc_last_present_ns = target;
+	AMediaCodec_releaseOutputBufferAtTime(decoder->codec, index, target);
+}
+
 static uint64_t mc_now_us(void)
 {
 	struct timespec t;
@@ -107,6 +143,7 @@ ChiakiErrorCode android_chiaki_video_decoder_init(AndroidChiakiVideoDecoder *dec
 	decoder->mc_frames_shown = 0;
 	decoder->mc_decode_ms = 0;
 	decoder->mc_last_pts = 0;
+	decoder->mc_last_present_ns = 0;
 	decoder->mc_frames_lost = 0;
 	return chiaki_mutex_init(&decoder->codec_mutex, false);
 }
@@ -325,7 +362,10 @@ static void *android_chiaki_video_decoder_output_thread_func(void *user)
 		ssize_t status = AMediaCodec_dequeueOutputBuffer(decoder->codec, &info, 50000); // MoonCast (#37): poll, see shutdown_output
 		if(status >= 0)
 		{
-			AMediaCodec_releaseOutputBuffer(decoder->codec, (size_t)status, info.size != 0);
+			if(info.size != 0)
+				mc_present(decoder, (size_t)status);
+			else
+				AMediaCodec_releaseOutputBuffer(decoder->codec, (size_t)status, false);
 			if(info.size != 0)
 			{
 				decoder->mc_frames_shown++;

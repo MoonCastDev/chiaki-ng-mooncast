@@ -627,6 +627,12 @@ JNIEXPORT void JNICALL JNI_FCN(decoderLatencyMode)(JNIEnv *env, jobject obj, jin
 	android_chiaki_video_decoder_set_latency_mode(mode);
 }
 
+// MoonCast: frame pacing for the next session (0 lowest delay, 1 balanced, 2 smoothest) at the stream's frame rate
+JNIEXPORT void JNICALL JNI_FCN(decoderPacing)(JNIEnv *env, jobject obj, jint mode, jint fps)
+{
+	android_chiaki_video_decoder_set_pacing(mode, fps);
+}
+
 JNIEXPORT jint JNICALL JNI_FCN(sessionGotoBed)(JNIEnv *env, jobject obj, jlong ptr)
 {
 	AndroidChiakiSession *session = (AndroidChiakiSession *)ptr;
