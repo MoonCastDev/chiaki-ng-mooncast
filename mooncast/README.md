@@ -33,4 +33,7 @@ mooncast/build-jni.sh /path/to/moonlight-android
 ```
 
 The script builds chiaki-ng's Android app and copies the stripped libraries for both ABIs into
-`app/src/main/jniLibs/` of the MoonCast app checkout.
+`app/src/main/jniLibs/` of the MoonCast app checkout. The SDK comes from `ANDROID_HOME`, or from the app's `local.properties`.
+
+The MoonCast app has this repo as a submodule (`third-party/chiaki-ng`) and runs the script itself during its build
+when the libraries are missing or this tree changed, so you normally don't run it by hand.
