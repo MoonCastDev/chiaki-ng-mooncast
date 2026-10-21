@@ -603,7 +603,7 @@ JNIEXPORT void JNICALL JNI_FCN(sessionSetControllerState)(JNIEnv *env, jobject o
 JNIEXPORT jdoubleArray JNICALL JNI_FCN(sessionStats)(JNIEnv *env, jobject obj, jlong ptr)
 {
 	AndroidChiakiSession *session = (AndroidChiakiSession *)ptr;
-	jdouble v[6] = { 0, 0, 0, 0, 0, 0 };
+	jdouble v[7] = { 0, 0, 0, 0, 0, 0, 0 };
 	if(session)
 	{
 		ChiakiStreamConnection *sc = &session->session.stream_connection;
@@ -613,11 +613,18 @@ JNIEXPORT jdoubleArray JNICALL JNI_FCN(sessionStats)(JNIEnv *env, jobject obj, j
 		v[3] = session->session.rtt_us / 1000.0;
 		v[4] = (jdouble)session->video_decoder.mc_frames_shown;
 		v[5] = (jdouble)session->video_decoder.mc_frames_lost;
+		v[6] = session->video_decoder.mc_decode_ms;
 	}
-	jdoubleArray r = E->NewDoubleArray(env, 6);
+	jdoubleArray r = E->NewDoubleArray(env, 7);
 	if(r)
-		E->SetDoubleArrayRegion(env, r, 0, 6, v);
+		E->SetDoubleArrayRegion(env, r, 0, 7, v);
 	return r;
+}
+
+// MoonCast: the PS5 decoder's latency mode for the next session (0 standard, 1 low latency, 2 ultra low latency)
+JNIEXPORT void JNICALL JNI_FCN(decoderLatencyMode)(JNIEnv *env, jobject obj, jint mode)
+{
+	android_chiaki_video_decoder_set_latency_mode(mode);
 }
 
 JNIEXPORT jint JNICALL JNI_FCN(sessionGotoBed)(JNIEnv *env, jobject obj, jlong ptr)

@@ -15,6 +15,7 @@ MoonCast's Android apps ([MoonCastDev/moonlight-android](https://github.com/Moon
 - `android/app/src/main/cpp/chiaki-jni.c` also: `psnCancel`, which stops the PSN connect in flight when the app leaves the PS5 screen or the console answers on the home network.
 - `android/app/src/main/cpp/video-decoder.c/.h`: a clean decoder shutdown (no codec call after stop, which aborts on
   Android 9; no input once shutting down or when the codec has lost its surface), MoonCast issue #37.
+- `android/app/src/main/cpp/video-decoder.c` also: the decoder latency mode (`decoderLatencyMode`: standard, low latency, ultra low latency), the same low-latency settings as MoonCast's PC player, with a retry without them; the input timestamps are real time, so the decode time is measured (`sessionStats` [6]).
 - `lib/src/remote/holepunch.c`, `lib/src/aia_openssl.c`: Android's curl has no CA store, so the app hands it the device's
   trusted roots (`MC_CA_BUNDLE`) for PSN; a longer wait (about 60 s) for a console in rest mode to join the PSN session.
 - `lib/src/streamconnection.c`, `lib/include/chiaki/streamconnection.h`: the round-trip time from the latest

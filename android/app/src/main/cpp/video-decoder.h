@@ -25,7 +25,12 @@ typedef struct android_chiaki_video_decoder_t
 	ChiakiCodec target_codec;
 	uint64_t mc_frames_shown; // MoonCast stats
 	uint64_t mc_frames_lost;
+	double mc_decode_ms;     // MoonCast stats: average decode time (input queued -> frame out), ms
+	uint64_t mc_last_pts;    // MoonCast: the input timestamps are real time (us), kept strictly rising
 } AndroidChiakiVideoDecoder;
+
+/** MoonCast: how hard the decoder is pushed for low latency (0 standard, 1 low latency, 2 ultra low latency). */
+void android_chiaki_video_decoder_set_latency_mode(int mode);
 
 ChiakiErrorCode android_chiaki_video_decoder_init(AndroidChiakiVideoDecoder *decoder, ChiakiLog *log, int32_t target_width, int32_t target_height, ChiakiCodec codec);
 void android_chiaki_video_decoder_fini(AndroidChiakiVideoDecoder *decoder);
