@@ -12,6 +12,7 @@ MoonCast's Android apps ([MoonCastDev/moonlight-android](https://github.com/Moon
 - `android/app/src/main/cpp/chiaki-jni.c`: Remote Play over the internet through PSN (hole punching with port guessing, no VPN
   or port forwarding); real packet-loss reporting (up to 5%) and a fresh keyframe when a frame can't be repaired, so the PS5
   lowers its bitrate on a lossy link; stream stats for the app's overlay.
+- `android/app/src/main/cpp/chiaki-jni.c` also: `psnCancel`, which stops the PSN connect in flight when the app leaves the PS5 screen or the console answers on the home network.
 - `android/app/src/main/cpp/video-decoder.c/.h`: a clean decoder shutdown (no codec call after stop, which aborts on
   Android 9; no input once shutting down or when the codec has lost its surface), MoonCast issue #37.
 - `lib/src/remote/holepunch.c`, `lib/src/aia_openssl.c`: Android's curl has no CA store, so the app hands it the device's

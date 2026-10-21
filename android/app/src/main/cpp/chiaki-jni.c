@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LicenseRef-AGPL-3.0-only-OpenSSL
 
 #include <jni.h>
+#include <pthread.h>
 
 #include <android/log.h>
 
@@ -227,6 +228,21 @@ static int mc_hex_nibble(char c)
 
 // Same steps as chiaki-ng's StreamSession::InitiatePsnConnection + ConnectPsnConnection: PSN brokers the
 // connection and only the control hole is punched here - chiaki_session punches the data hole itself.
+// MoonCast: the PSN connect in flight, so leaving the PS5 screen can cancel it (psnCancel) instead of the app waiting
+// out its timeouts (up to a minute each) while a new attempt starts next to it.
+static pthread_mutex_t mc_psn_mutex = PTHREAD_MUTEX_INITIALIZER;
+static ChiakiHolepunchSession mc_psn_active = NULL;
+static bool mc_psn_cancelled = false;
+
+static void mc_psn_set_active(ChiakiHolepunchSession hs)
+{
+	pthread_mutex_lock(&mc_psn_mutex);
+	mc_psn_active = hs;
+	if(hs)
+		mc_psn_cancelled = false;
+	pthread_mutex_unlock(&mc_psn_mutex);
+}
+
 static ChiakiHolepunchSession mc_psn_connect(ChiakiLog *log, const char *token, const char *duid_hex, bool ps5)
 {
 	size_t hex_len = strlen(duid_hex);
@@ -252,6 +268,7 @@ static ChiakiHolepunchSession mc_psn_connect(ChiakiLog *log, const char *token, 
 		CHIAKI_LOGE(log, "MoonCast PSN: hole-punch session init failed (token?)");
 		return NULL;
 	}
+	mc_psn_set_active(hs);
 	// Port guessing (chiaki-ng's fix for port-rewriting NATs): when the STUN test sees a router that rewrites our
 	// port, advertise a spread of guessed ports and open many sockets so the console's packets hit one of them.
 	// Some JAL<->home punches got no candidate response at all; this targets that. Defaults: 75 guesses, 250 sockets.
@@ -269,6 +286,15 @@ static ChiakiHolepunchSession mc_psn_connect(ChiakiLog *log, const char *token, 
 		err = chiaki_holepunch_session_start(hs, duid, ps5 ? CHIAKI_HOLEPUNCH_CONSOLE_TYPE_PS5 : CHIAKI_HOLEPUNCH_CONSOLE_TYPE_PS4);
 	if(err == CHIAKI_ERR_SUCCESS)
 		err = chiaki_holepunch_session_punch_hole(hs, CHIAKI_HOLEPUNCH_PORT_TYPE_CTRL);
+	mc_psn_set_active(NULL);
+	pthread_mutex_lock(&mc_psn_mutex);
+	bool cancelled = mc_psn_cancelled;
+	pthread_mutex_unlock(&mc_psn_mutex);
+	if(err == CHIAKI_ERR_SUCCESS && cancelled)
+	{
+		CHIAKI_LOGI(log, "MoonCast PSN: cancelled by the app after the hole-punch, dropping it");
+		err = CHIAKI_ERR_CANCELED;
+	}
 	if(err != CHIAKI_ERR_SUCCESS)
 	{
 		CHIAKI_LOGE(log, "MoonCast PSN: hole-punch failed: %s", chiaki_error_string(err));
@@ -277,6 +303,16 @@ static ChiakiHolepunchSession mc_psn_connect(ChiakiLog *log, const char *token, 
 	}
 	CHIAKI_LOGI(log, "MoonCast PSN: control hole punched, starting session over the internet");
 	return hs;
+}
+
+// MoonCast: stop the PSN connect in flight (the PS5 screen closed, or the console now answers on the home network)
+JNIEXPORT void JNICALL JNI_FCN(psnCancel)(JNIEnv *env, jobject obj)
+{
+	pthread_mutex_lock(&mc_psn_mutex);
+	mc_psn_cancelled = true;
+	if(mc_psn_active)
+		chiaki_holepunch_main_thread_cancel(mc_psn_active, false);
+	pthread_mutex_unlock(&mc_psn_mutex);
 }
 
 JNIEXPORT void JNICALL JNI_FCN(sessionCreate)(JNIEnv *env, jobject obj, jobject result, jobject connect_info_obj, jstring log_file_str, jboolean log_verbose, jobject java_session)
