@@ -39,3 +39,6 @@ chiaki.conf
 .cache/
 *.vscode
 site/
+
+# MoonCast build-jni.sh
+android/app/.mooncast-build-stamp

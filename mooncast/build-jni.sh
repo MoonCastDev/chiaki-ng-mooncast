@@ -18,7 +18,16 @@ echo "sdk.dir=$SDK" > local.properties
 # nanopb generates chiaki's protocol code with protoc
 command -v protoc >/dev/null 2>&1 || { echo "build-jni.sh: protoc is needed on the PATH (nanopb)" >&2; exit 1; }
 
+# A change to chiaki's build files (an OpenSSL upgrade, say) leaves the native cache inconsistent: old configured
+# headers next to new ones. Start the native build clean when they change.
+STAMP=app/.mooncast-build-stamp
+NOW=$(cat ../CMakeLists.txt ../cmake/*.cmake app/CMakeLists.txt app/build.gradle | cksum)
+if [ "$(cat "$STAMP" 2>/dev/null)" != "$NOW" ]; then
+    rm -rf app/.cxx app/build
+fi
+
 ./gradlew assembleDebug
+echo "$NOW" > "$STAMP"
 OUT=app/build/intermediates/stripped_native_libs/debug/stripDebugDebugSymbols/out/lib
 for abi in arm64-v8a armeabi-v7a; do
     mkdir -p "$APP/app/src/main/jniLibs/$abi"
