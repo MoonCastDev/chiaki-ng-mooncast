@@ -18,6 +18,7 @@ MoonCast's Android apps ([MoonCastDev/moonlight-android](https://github.com/Moon
   trusted roots (`MC_CA_BUNDLE`) for PSN; a longer wait (about 60 s) for a console in rest mode to join the PSN session.
 - `lib/src/streamconnection.c`, `lib/include/chiaki/streamconnection.h`: the round-trip time from the latest
   connection-quality message, for the stats.
+- `cmake/OpenSSLExternalProject.cmake`: OpenSSL 3.5.9 (the 3.5 LTS line, fixes until 2030) instead of 1.1.1w, which has been end of life since September 2023; OpenSSL 3 looks for `ANDROID_NDK_ROOT`.
 - `android/app/build.gradle`: only the two ABIs MoonCast ships (arm64-v8a, armeabi-v7a). `android/gradle.properties`: build memory.
 
 `patch-scripts/` keeps the scripts the changes were first made with, for the record; the tree already has them applied.

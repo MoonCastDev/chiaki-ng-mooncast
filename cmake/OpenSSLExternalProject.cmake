@@ -20,7 +20,8 @@ if(ANDROID_ABI)
 
 	set(OPENSSL_CONFIG_EXTRA_ARGS "-D__ANDROID_API__=${ANDROID_NATIVE_API_LEVEL}")
 	get_filename_component(ANDROID_NDK_BIN_PATH "${CMAKE_C_COMPILER}" DIRECTORY)
-	set(OPENSSL_BUILD_ENV "ANDROID_NDK_HOME=${ANDROID_NDK}" "PATH=${ANDROID_NDK_BIN_PATH}:$ENV{PATH}")
+	# MoonCast: OpenSSL 3 looks for ANDROID_NDK_ROOT (1.1.1 used ANDROID_NDK_HOME)
+	set(OPENSSL_BUILD_ENV "ANDROID_NDK_ROOT=${ANDROID_NDK}" "ANDROID_NDK_HOME=${ANDROID_NDK}" "PATH=${ANDROID_NDK_BIN_PATH}:$ENV{PATH}")
 else()
 	if(UNIX AND NOT APPLE AND CMAKE_SIZEOF_VOID_P STREQUAL "8")
 		set(OPENSSL_OS_COMPILER "linux-x86_64")
@@ -33,8 +34,9 @@ endif()
 
 find_program(MAKE_EXE NAMES gmake make)
 ExternalProject_Add(OpenSSL-ExternalProject
-		URL https://www.openssl.org/source/openssl-1.1.1w.tar.gz
-		URL_HASH SHA256=cf3098950cb4d853ad95c0841f1f9c6d3dc102dccfcacd521d93925208b76ac8
+		# MoonCast: OpenSSL 3.5 LTS (security fixes until 2030) instead of 1.1.1w (end of life since 2023-09)
+		URL https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz
+		URL_HASH SHA256=603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
 		INSTALL_DIR "${OPENSSL_INSTALL_DIR}"
 		CONFIGURE_COMMAND ${CMAKE_COMMAND} -E env ${OPENSSL_BUILD_ENV}
 			"<SOURCE_DIR>/Configure" "--prefix=<INSTALL_DIR>" no-shared ${OPENSSL_CONFIG_EXTRA_ARGS} "${OPENSSL_OS_COMPILER}"
@@ -75,7 +77,7 @@ endif()
 # Mark OpenSSL as found so FindOpenSSL.cmake is a no-op
 set(OPENSSL_FOUND TRUE CACHE BOOL "" FORCE)
 set(OpenSSL_FOUND TRUE CACHE BOOL "" FORCE)
-set(OPENSSL_VERSION "1.1.1w" CACHE STRING "" FORCE)
+set(OPENSSL_VERSION "3.5.9" CACHE STRING "" FORCE)
 set(OPENSSL_INCLUDE_DIR "${OPENSSL_INSTALL_DIR}/include" CACHE PATH "" FORCE)
 set(OPENSSL_CRYPTO_LIBRARY "${OPENSSL_INSTALL_DIR}/lib/libcrypto.a" CACHE FILEPATH "" FORCE)
 set(OPENSSL_SSL_LIBRARY "${OPENSSL_INSTALL_DIR}/lib/libssl.a" CACHE FILEPATH "" FORCE)
