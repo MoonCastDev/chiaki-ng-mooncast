@@ -12,6 +12,8 @@
 #include <strings.h>
 #include <time.h>
 #include <dlfcn.h>
+#include <sys/resource.h>
+#include <unistd.h>
 
 // MoonCast: the PS5 decoder's latency mode, set by the app before each session (Settings, PlayStation, Decoder).
 // The same keys MoonCast's PC player sets (Moonlight's MediaCodecHelper, Artemis' ultra presets).
@@ -104,6 +106,7 @@ static void mc_low_latency_keys(AMediaFormat *f, const char *name, int mode, int
 		bool omx = mc_name_starts(name, "omx.qcom");
 		AMediaFormat_setInt32(f, "vendor.qti-ext-dec-picture-order.enable", mode >= 2 && omx ? 0 : 1);
 		AMediaFormat_setInt32(f, "vendor.qti-ext-dec-low-latency.enable", 1);
+		AMediaFormat_setInt32(f, "operating-rate", 32767);   // run the decoder flat out (Moonlight does on Qualcomm)
 		if(mode >= 2)
 		{
 			// software output fencing: what cuts latency on Snapdragon 8 Gen 2, 8s Gen 3 and 8 Elite (Artemis)
@@ -137,6 +140,33 @@ static void mc_low_latency_keys(AMediaFormat *f, const char *name, int mode, int
 
 static void *android_chiaki_video_decoder_output_thread_func(void *user);
 
+// MoonCast: when each frame really reached the screen (Android 13+, looked up at run time). Render wait = decoded ->
+// on screen, i.e. waiting for the display's next refresh (and Frame pacing's hold), apart from the decode itself.
+typedef void (*mc_rendered_cb)(AMediaCodec *, void *, int64_t, int64_t);
+static void mc_on_rendered(AMediaCodec *codec, void *user, int64_t media_us, int64_t system_ns)
+{
+	(void)codec;
+	AndroidChiakiVideoDecoder *decoder = user;
+	if(media_us <= 0 || system_ns <= 0)
+		return;
+	int64_t shown_us = system_ns / 1000;
+	int64_t total_us = shown_us - media_us;          // queued -> on screen
+	if(total_us <= 0 || total_us > 1000000)
+		return;
+	double wait = total_us / 1000.0 - decoder->mc_decode_ms;
+	if(wait < 0)
+		wait = 0;
+	decoder->mc_render_ms = decoder->mc_render_ms <= 0 ? wait : decoder->mc_render_ms * 0.95 + wait * 0.05;
+}
+
+static void mc_watch_rendered(AndroidChiakiVideoDecoder *decoder)
+{
+	media_status_t (*set_cb)(AMediaCodec *, mc_rendered_cb, void *) =
+		(media_status_t (*)(AMediaCodec *, mc_rendered_cb, void *))dlsym(RTLD_DEFAULT, "AMediaCodec_setOnFrameRenderedCallback");
+	if(set_cb)
+		set_cb(decoder->codec, mc_on_rendered, decoder);
+}
+
 ChiakiErrorCode android_chiaki_video_decoder_init(AndroidChiakiVideoDecoder *decoder, ChiakiLog *log, int32_t target_width, int32_t target_height, ChiakiCodec codec)
 {
 	decoder->log = log;
@@ -151,6 +181,9 @@ ChiakiErrorCode android_chiaki_video_decoder_init(AndroidChiakiVideoDecoder *dec
 	decoder->mc_last_pts = 0;
 	decoder->mc_last_present_ns = 0;
 	decoder->mc_frames_lost = 0;
+	decoder->mc_render_ms = 0;
+	decoder->mc_last_out_us = 0;
+	decoder->mc_ll_name[0] = 0;
 	return chiaki_mutex_init(&decoder->codec_mutex, false);
 }
 
@@ -230,6 +263,31 @@ void android_chiaki_video_decoder_set_surface(AndroidChiakiVideoDecoder *decoder
 		CHIAKI_LOGE(decoder->log, "Failed to create AMediaCodec for mime type %s", mime);
 		goto error_surface;
 	}
+	// MoonCast: Snapdragon (and MediaTek) list a separate low-latency decoder next to the default one
+	// (c2.qti.hevc.decoder.low_latency on the Odin 2's 8 Gen 2), which the "by type" lookup never picks. It
+	// returns each frame as soon as it's decoded; the default one holds frames back. Use it unless Standard.
+	if(mc_latency_mode >= 1)
+	{
+		char *base_buf;
+		const char *base = mc_codec_name(decoder->codec, &base_buf);
+		const char *suffixes[] = { ".low_latency", ".lowlatency" };
+		for(size_t i = 0; i < 2; i++)
+		{
+			char ll[160];
+			snprintf(ll, sizeof(ll), "%s%s", base, suffixes[i]);
+			AMediaCodec *c = AMediaCodec_createCodecByName(ll);
+			if(c)
+			{
+				CHIAKI_LOGI(decoder->log, "MoonCast decoder: using %s instead of %s", ll, base);
+				AMediaCodec_delete(decoder->codec);
+				decoder->codec = c;
+				decoder->mc_ll_name[0] = 0;
+				strncpy(decoder->mc_ll_name, ll, sizeof(decoder->mc_ll_name) - 1);
+				break;
+			}
+		}
+		free(base_buf);
+	}
 
 	AMediaFormat *format = AMediaFormat_new();
 	AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, mime);
@@ -249,7 +307,7 @@ void android_chiaki_video_decoder_set_surface(AndroidChiakiVideoDecoder *decoder
 			// a decoder that refused a key: start again with a fresh decoder and fewer of them
 			AMediaFormat_delete(format);
 			AMediaCodec_delete(decoder->codec);
-			decoder->codec = AMediaCodec_createDecoderByType(mime);
+			decoder->codec = decoder->mc_ll_name[0] ? AMediaCodec_createCodecByName(decoder->mc_ll_name) : AMediaCodec_createDecoderByType(mime);
 			if(!decoder->codec)
 				break;
 			format = AMediaFormat_new();
@@ -281,6 +339,7 @@ void android_chiaki_video_decoder_set_surface(AndroidChiakiVideoDecoder *decoder
 		goto error_codec;
 	}
 
+	mc_watch_rendered(decoder);
 	r = AMediaCodec_start(decoder->codec);
 	AMediaFormat_delete(format);
 	if(r != AMEDIA_OK)
@@ -374,6 +433,9 @@ beach:
 static void *android_chiaki_video_decoder_output_thread_func(void *user)
 {
 	AndroidChiakiVideoDecoder *decoder = user;
+	// MoonCast: this thread hands frames to the screen; give it display priority (as Moonlight's renderer has)
+	if(setpriority(PRIO_PROCESS, (id_t)gettid(), -8) != 0)
+		CHIAKI_LOGW(decoder->log, "MoonCast decoder: couldn't raise the output thread's priority");
 
 	while(1)
 	{
@@ -381,21 +443,21 @@ static void *android_chiaki_video_decoder_output_thread_func(void *user)
 		ssize_t status = AMediaCodec_dequeueOutputBuffer(decoder->codec, &info, 50000); // MoonCast (#37): poll, see shutdown_output
 		if(status >= 0)
 		{
+			// MoonCast: decode time = input queued -> decoded frame handed back (what other players call "decode"),
+			// measured before the frame is released to the screen; smoothed over about the last 20 frames
+			uint64_t now = mc_now_us();
+			if(info.size != 0 && info.presentationTimeUs > 0 && now >= (uint64_t)info.presentationTimeUs && now - (uint64_t)info.presentationTimeUs < 1000000)
+			{
+				double ms = (now - (uint64_t)info.presentationTimeUs) / 1000.0;
+				decoder->mc_decode_ms = decoder->mc_decode_ms <= 0 ? ms : decoder->mc_decode_ms * 0.95 + ms * 0.05;
+				decoder->mc_last_out_us = now;
+			}
 			if(info.size != 0)
 				mc_present(decoder, (size_t)status);
 			else
 				AMediaCodec_releaseOutputBuffer(decoder->codec, (size_t)status, false);
 			if(info.size != 0)
-			{
 				decoder->mc_frames_shown++;
-				// MoonCast: decode time of this frame, smoothed (about the last 20 frames)
-				uint64_t now = mc_now_us();
-				if(info.presentationTimeUs > 0 && now >= (uint64_t)info.presentationTimeUs && now - (uint64_t)info.presentationTimeUs < 1000000)
-				{
-					double ms = (now - (uint64_t)info.presentationTimeUs) / 1000.0;
-					decoder->mc_decode_ms = decoder->mc_decode_ms <= 0 ? ms : decoder->mc_decode_ms * 0.95 + ms * 0.05;
-				}
-			}
 			if(info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM)
 			{
 				CHIAKI_LOGI(decoder->log, "AMediaCodec reported EOS");

@@ -28,6 +28,9 @@ typedef struct android_chiaki_video_decoder_t
 	double mc_decode_ms;     // MoonCast stats: average decode time (input queued -> frame out), ms
 	uint64_t mc_last_pts;    // MoonCast: the input timestamps are real time (us), kept strictly rising
 	int64_t mc_last_present_ns; // MoonCast frame pacing: when the last frame was asked to show
+	double mc_render_ms;     // MoonCast stats: average decoded -> on screen (render wait), ms; 0 if unknown
+	uint64_t mc_last_out_us; // MoonCast: when the last decoded frame came out
+	char mc_ll_name[160];    // MoonCast: the low-latency decoder in use, if any
 } AndroidChiakiVideoDecoder;
 
 /** MoonCast frame pacing: 0 lowest delay (show at once), 1 balanced (up to 1 frame later), 2 smoothest (up to 3).

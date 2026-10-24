@@ -599,11 +599,12 @@ JNIEXPORT void JNICALL JNI_FCN(sessionSetControllerState)(JNIEnv *env, jobject o
 	chiaki_session_set_controller_state(&session->session, &controller_state);
 }
 
-/** MoonCast: [measured Mbps, packet loss 0..1, PS5-reported rtt, rtt measured at connect (ms), frames shown, frames lost] */
+/** MoonCast: [measured Mbps, packet loss 0..1, PS5-reported rtt, rtt measured at connect (ms), frames shown, frames lost,
+ * decode ms (queued -> decoded), render wait ms (decoded -> on screen, Android 13+)] */
 JNIEXPORT jdoubleArray JNICALL JNI_FCN(sessionStats)(JNIEnv *env, jobject obj, jlong ptr)
 {
 	AndroidChiakiSession *session = (AndroidChiakiSession *)ptr;
-	jdouble v[7] = { 0, 0, 0, 0, 0, 0, 0 };
+	jdouble v[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
 	if(session)
 	{
 		ChiakiStreamConnection *sc = &session->session.stream_connection;
@@ -614,10 +615,11 @@ JNIEXPORT jdoubleArray JNICALL JNI_FCN(sessionStats)(JNIEnv *env, jobject obj, j
 		v[4] = (jdouble)session->video_decoder.mc_frames_shown;
 		v[5] = (jdouble)session->video_decoder.mc_frames_lost;
 		v[6] = session->video_decoder.mc_decode_ms;
+		v[7] = session->video_decoder.mc_render_ms;
 	}
-	jdoubleArray r = E->NewDoubleArray(env, 7);
+	jdoubleArray r = E->NewDoubleArray(env, 8);
 	if(r)
-		E->SetDoubleArrayRegion(env, r, 0, 7, v);
+		E->SetDoubleArrayRegion(env, r, 0, 8, v);
 	return r;
 }
 
