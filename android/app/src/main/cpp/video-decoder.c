@@ -48,7 +48,9 @@ static void mc_present(AndroidChiakiVideoDecoder *decoder, size_t index)
 {
 	if(mc_pacing_mode <= 0)
 	{
-		AMediaCodec_releaseOutputBuffer(decoder->codec, index, true);
+		// at once; with a timestamp (now) so Android reports when it reached the screen (render wait, test268:
+		// a plain release to the surface never reported on the Odin's codec2 decoder)
+		AMediaCodec_releaseOutputBufferAtTime(decoder->codec, index, mc_now_ns());
 		return;
 	}
 	int64_t now = mc_now_ns();
@@ -163,8 +165,8 @@ static void mc_watch_rendered(AndroidChiakiVideoDecoder *decoder)
 {
 	media_status_t (*set_cb)(AMediaCodec *, mc_rendered_cb, void *) =
 		(media_status_t (*)(AMediaCodec *, mc_rendered_cb, void *))dlsym(RTLD_DEFAULT, "AMediaCodec_setOnFrameRenderedCallback");
-	if(set_cb)
-		set_cb(decoder->codec, mc_on_rendered, decoder);
+	media_status_t r = set_cb ? set_cb(decoder->codec, mc_on_rendered, decoder) : AMEDIA_ERROR_UNSUPPORTED;
+	CHIAKI_LOGI(decoder->log, "MoonCast decoder: frame-rendered callback %s (%d)", set_cb ? "set" : "not available", (int)r);
 }
 
 ChiakiErrorCode android_chiaki_video_decoder_init(AndroidChiakiVideoDecoder *decoder, ChiakiLog *log, int32_t target_width, int32_t target_height, ChiakiCodec codec)
@@ -184,6 +186,7 @@ ChiakiErrorCode android_chiaki_video_decoder_init(AndroidChiakiVideoDecoder *dec
 	decoder->mc_render_ms = 0;
 	decoder->mc_last_out_us = 0;
 	decoder->mc_ll_name[0] = 0;
+	decoder->mc_diag_n = 0; decoder->mc_diag_feed_us = 0; decoder->mc_diag_bytes = 0;
 	return chiaki_mutex_init(&decoder->codec_mutex, false);
 }
 
@@ -416,6 +419,17 @@ bool android_chiaki_video_decoder_video_sample(uint8_t *buf, size_t buf_size, in
 			pts = decoder->mc_last_pts + 1;
 		decoder->mc_last_pts = pts;
 		media_status_t r = AMediaCodec_queueInputBuffer(decoder->codec, (size_t)codec_buf_index, 0, codec_sample_size, pts, 0);
+		// MoonCast diagnostics: how long the feeding side takes (dequeue input + copy + queue), every 1800 frames
+		uint64_t fed = mc_now_us();
+		decoder->mc_diag_feed_us += fed - pts;
+		decoder->mc_diag_bytes += codec_sample_size;
+		if(++decoder->mc_diag_n >= 1800)
+		{
+			CHIAKI_LOGI(decoder->log, "MoonCast decoder diag: queue call %.3f ms avg, %zu bytes/frame avg, decode %.2f ms, render wait %.2f ms",
+				decoder->mc_diag_feed_us / 1000.0 / decoder->mc_diag_n, (size_t)(decoder->mc_diag_bytes / decoder->mc_diag_n),
+				decoder->mc_decode_ms, decoder->mc_render_ms);
+			decoder->mc_diag_n = 0; decoder->mc_diag_feed_us = 0; decoder->mc_diag_bytes = 0;
+		}
 		if(r != AMEDIA_OK)
 		{
 			CHIAKI_LOGE(decoder->log, "AMediaCodec_queueInputBuffer() failed: %d", (int)r);
@@ -436,6 +450,8 @@ static void *android_chiaki_video_decoder_output_thread_func(void *user)
 	// MoonCast: this thread hands frames to the screen; give it display priority (as Moonlight's renderer has)
 	if(setpriority(PRIO_PROCESS, (id_t)gettid(), -8) != 0)
 		CHIAKI_LOGW(decoder->log, "MoonCast decoder: couldn't raise the output thread's priority");
+	else
+		CHIAKI_LOGI(decoder->log, "MoonCast decoder: output thread at priority %d", getpriority(PRIO_PROCESS, (id_t)gettid()));
 
 	while(1)
 	{
